@@ -224,7 +224,13 @@ def process_requests(reqs):
 
     except Exception as exc:
         log(str(exc), level=ERROR)
-        msg = "Unexpected error occurred while processing requests: %s" % reqs
+        if isinstance(exc, CalledProcessError):
+            detail = exc.stderr or exc.output or str(exc)
+        else:
+            detail = str(exc)
+        if isinstance(detail, bytes):
+            detail = detail.decode("UTF-8", errors="replace")
+        msg = "Unexpected error occurred while processing requests: {}".format(detail)
         log(msg, level=ERROR)
         return {"exit-code": 1, "stderr": msg}
 

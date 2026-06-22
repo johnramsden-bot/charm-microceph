@@ -35,6 +35,7 @@ from ops.framework import (
     ObjectEvents,
     StoredState,
 )
+from ops.model import ActiveStatus, BlockedStatus
 from ops_sunbeam.interfaces import OperatorPeers
 from ops_sunbeam.relation_handlers import BasePeerHandler, RelationHandler
 
@@ -689,6 +690,31 @@ class CephClientProviderHandler(RelationHandler):
         logger.info(f"Processing broker req {event.broker_req}")
         broker_result = process_requests(event.broker_req)
         logger.info(broker_result)
+
+        # process_requests returns a JSON-encoded response string; parse it to
+        # inspect the exit code.
+        try:
+            result = json.loads(broker_result) if isinstance(broker_result, str) else broker_result
+        except (TypeError, ValueError):
+            result = {
+                "exit-code": 1,
+                "stderr": "malformed broker response: {}".format(broker_result),
+            }
+
+        if result.get("exit-code") != 0:
+            # A broker op (e.g. create-pool) failed. Surface an actionable
+            # blocked status so the operator can see why the requesting charm
+            # is stuck, and defer so the request is retried once the underlying
+            # issue (e.g. mon_max_pg_per_osd too low) is resolved. The response
+            # is intentionally not sent yet: marking the request processed would
+            # prevent the retry (LP #2147014).
+            stderr = result.get("stderr") or "broker request failed"
+            msg = "Ceph broker request from {} failed: {}".format(event.client_unit_name, stderr)
+            logger.error(msg)
+            self.status.set(BlockedStatus(msg))
+            event.defer()
+            return
+
         unit_response_key = "broker-rsp-" + event.client_unit_name
         response = {unit_response_key: broker_result}
         client_id, caps = self.get_key_params(event)
@@ -702,6 +728,8 @@ class CephClientProviderHandler(RelationHandler):
             response,
             data,
         )
+        # Broker request succeeded; clear any previous failure status.
+        self.status.set(ActiveStatus(""))
         # Ignore the callback function??
 
     def notify_all(self):

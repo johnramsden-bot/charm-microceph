@@ -714,6 +714,28 @@ class PoolCreationError(Exception):
         super(PoolCreationError, self).__init__(message)
 
 
+def _run_ceph_pool_cmd(cmd):
+    """Run a Ceph pool command, raising PoolCreationError with stderr on failure.
+
+    ``check_call`` does not capture stderr, so the real Ceph error text (for
+    example ``TOO_MANY_PGS`` when the per-OSD placement-group limit is exceeded)
+    never reaches the broker response: the requesting charm only sees a generic
+    "Unexpected error occurred" message and cannot surface an actionable error
+    to the operator (LP #2147014). Capture stderr so pool creation failures are
+    propagated to the broker response.
+    """
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("UTF-8", errors="replace").strip()
+        # Some Ceph CLI versions emit the error on stdout; fall back to it so
+        # the real cause always reaches the broker response.
+        if not stderr:
+            stderr = result.stdout.decode("UTF-8", errors="replace").strip()
+        msg = "Ceph command {} failed: {}".format(cmd, stderr)
+        log(msg, level=ERROR)
+        raise PoolCreationError(msg)
+
+
 class BasePool(object):
     """An object oriented approach to Ceph pool creation.
 
@@ -1083,7 +1105,7 @@ class ErasurePool(BasePool):
             "erasure",
             self.erasure_code_profile,
         ]
-        check_call(cmd)
+        _run_ceph_pool_cmd(cmd)
 
     def _post_create(self):
         super(ErasurePool, self)._post_create()
@@ -1164,7 +1186,7 @@ class ReplicatedPool(BasePool):
         if self.profile_name:
             cmd.append(self.profile_name)
 
-        check_call(cmd)
+        _run_ceph_pool_cmd(cmd)
 
     def _post_create(self):
         # Set the pool replica size
