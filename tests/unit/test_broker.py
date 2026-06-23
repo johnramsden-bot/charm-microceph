@@ -342,6 +342,58 @@ class TestBroker(test_utils.CharmTestCase):
         list_fs_volumes.assert_not_called()
         create_fs_volume.assert_not_called()
 
+    @patch("ceph.subprocess.run")
+    @patch.object(broker, "pool_exists")
+    def test_create_pool_failure_surfaces_ceph_error(self, pool_exists, mock_run):
+        """LP #2147014: a failed create-pool surfaces the real Ceph error.
+
+        Previously the broker response swallowed the underlying Ceph error and
+        dumped the entire request dict into ``stderr`` instead, leaving the
+        requesting charm (e.g. gnocchi-k8s) with an unactionable message and no
+        way to report why pool creation failed.
+        """
+        pool_exists.return_value = False
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout=b"",
+            stderr=b"Error E2BIG: 'gnocchi' pool creation refused: "
+            b"TOO_MANY_PGS (417 > max 400)",
+        )
+        reqs = json.dumps(
+            {
+                "api-version": 1,
+                "request-id": "abc123",
+                "ops": [{"op": "create-pool", "name": "gnocchi", "replicas": 3}],
+            }
+        )
+        rc = json.loads(broker.process_requests(reqs))
+        self.assertEqual(rc["exit-code"], 1)
+        # The real Ceph error must be surfaced so the requesting charm can act.
+        self.assertIn("TOO_MANY_PGS", rc["stderr"])
+        # The raw request dict must not be dumped into the response stderr.
+        self.assertNotIn("api-version", rc["stderr"])
+        self.assertNotIn("'ops'", rc["stderr"])
+
+    @patch.object(broker, "process_requests_v1")
+    def test_broker_failure_surfaces_called_process_error_stderr(self, mock_v1):
+        """A bare CalledProcessError from a broker op surfaces its real stderr.
+
+        LP #2147014: pool creation flows through PoolCreationError (covered
+        above); other ops may raise bare CalledProcessError. The handler must
+        surface the captured stderr/output (bytes decoded) for those too,
+        rather than dumping the request dict.
+        """
+        mock_v1.side_effect = broker.CalledProcessError(
+            1, ["microceph.ceph", "x"], stderr=b"ceph error: real detail"
+        )
+        reqs = json.dumps({"api-version": 1, "request-id": "r2", "ops": [{"op": "anything"}]})
+        rc = json.loads(broker.process_requests(reqs))
+        self.assertEqual(rc["exit-code"], 1)
+        self.assertIn("ceph error: real detail", rc["stderr"])
+        # The raw request dict must not be dumped.
+        self.assertNotIn("api-version", rc["stderr"])
+        self.assertNotIn("'ops'", rc["stderr"])
+
     @patch("ceph.check_call")
     @patch("ceph.check_output")
     def test_broker_misc(self, check_output, check_call):
